@@ -1,17 +1,15 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Extension, Json, Router,
+    Json, Router,
 };
-use kv::{Codec, Store};
+use kv::{Bucket, Codec, Store};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Song {
@@ -31,11 +29,46 @@ struct SongNotFound<'a> {
     error: &'a str,
 }
 
+#[derive(Clone)]
+struct AppState<'a> {
+    db: Bucket<'a, kv::Integer, kv::Json<Song>>,
+    is_dirty: Arc<Mutex<bool>>,
+}
+
 #[tokio::main]
 async fn main() {
     let user_count = Arc::new(Mutex::new(0));
+    let is_dirty = Arc::new(Mutex::new(false));
     let cfg = kv::Config::new("./song_db");
     let store = Store::new(cfg).unwrap();
+    let db = store
+        .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
+        .unwrap();
+    let state = AppState {
+        db,
+        is_dirty: Arc::clone(&is_dirty),
+    };
+
+    tokio::spawn(async move {
+        let db = store
+            .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
+            .unwrap();
+
+        loop {
+            let mut flush = false;
+            {
+                let mut dirty = is_dirty.lock().await;
+                if *dirty {
+                    flush = true;
+                    *dirty = false;
+                }
+            }
+
+            if flush {
+                db.flush_async().await.unwrap();
+            }
+        }
+    });
 
     let app = Router::new()
         .route(
@@ -45,7 +78,7 @@ async fn main() {
         .route(
             "/count",
             get(|| async move {
-                let mut user_count = user_count.lock().unwrap();
+                let mut user_count = user_count.lock().await;
                 *user_count += 1;
                 format!("Visit count: {}", *user_count)
             }),
@@ -53,35 +86,32 @@ async fn main() {
         .route("/songs/new", post(add_song))
         .route("/songs/search", get(search_song))
         .route("/songs/play/:id", get(play_song))
-        .layer(Extension(store));
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("The server is currently listening on localhost:8080.");
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn add_song(Extension(store): Extension<Store>, Json(payload): Json<Song>) -> Json<Song> {
-    let db = store
-        .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
-        .unwrap();
+async fn add_song(State(state): State<AppState<'_>>, Json(payload): Json<Song>) -> Json<Song> {
+    let db = &state.db;
 
     let id = db.len() + 1;
-    let song = Song { id, ..payload };
+    let song = kv::Json(Song { id, ..payload });
 
-    db.set(&kv::Integer::from(id), &kv::Json(song.clone()))
-        .unwrap();
-    db.flush_async().await.unwrap();
+    db.set(&kv::Integer::from(id), &song).unwrap();
 
-    Json(song)
+    let mut dirty = state.is_dirty.lock().await;
+    *dirty = true;
+
+    Json(song.into_inner())
 }
 
 async fn search_song(
-    Extension(store): Extension<Store>,
+    State(state): State<AppState<'_>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<Vec<Song>> {
-    let db = store
-        .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
-        .unwrap();
+    let db = &state.db;
 
     let songs = db
         .iter()
@@ -135,16 +165,14 @@ async fn search_song(
 }
 
 async fn play_song(
-    Extension(store): Extension<Store>,
+    State(state): State<AppState<'_>>,
     Path(params): Path<HashMap<String, String>>,
 ) -> impl IntoResponse {
     const ERROR_JSON: Json<SongNotFound> = Json(SongNotFound {
         error: "Song not found",
     });
 
-    let db = store
-        .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
-        .unwrap();
+    let db = &state.db;
 
     let id = match params.get("id") {
         Some(id) => id.parse::<usize>().unwrap(),
@@ -153,17 +181,17 @@ async fn play_song(
 
     let mut song = match db.get(&kv::Integer::from(id)) {
         Ok(item) => match item {
-            Some(song) => song.into_inner(),
+            Some(song) => song,
             None => return (StatusCode::NOT_FOUND, ERROR_JSON.into_response()),
         },
         Err(_) => return (StatusCode::NOT_FOUND, ERROR_JSON.into_response()),
     };
 
-    song.play_count += 1;
+    song.0.play_count += 1;
 
-    db.set(&kv::Integer::from(id), &kv::Json(song.clone()))
-        .unwrap();
-    db.flush_async().await.unwrap();
+    db.set(&kv::Integer::from(id), &song).unwrap();
+    let mut is_dirty = state.is_dirty.lock().await;
+    *is_dirty = true;
 
-    (StatusCode::OK, Json(song).into_response())
+    (StatusCode::OK, Json(song.into_inner()).into_response())
 }
