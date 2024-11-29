@@ -7,21 +7,23 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use kv::{Bucket, Codec, Store};
 use serde::{Deserialize, Serialize};
+use sqlx::{migrate::MigrateDatabase, prelude::FromRow, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+const DB_URL: &str = "sqlite://songs.db";
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize)]
 struct Song {
     #[serde(default)]
-    id: usize,
+    id: i64,
 
     title: String,
     artist: String,
     genre: String,
 
     #[serde(default)]
-    play_count: u32,
+    play_count: i64,
 }
 
 #[derive(Serialize)]
@@ -30,45 +32,38 @@ struct SongNotFound<'a> {
 }
 
 #[derive(Clone)]
-struct AppState<'a> {
-    db: Bucket<'a, kv::Integer, kv::Json<Song>>,
-    is_dirty: Arc<Mutex<bool>>,
+struct AppState {
+    db: SqlitePool,
 }
 
 #[tokio::main]
 async fn main() {
     let user_count = Arc::new(Mutex::new(0));
-    let is_dirty = Arc::new(Mutex::new(false));
-    let cfg = kv::Config::new("./song_db");
-    let store = Store::new(cfg).unwrap();
-    let db = store
-        .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
-        .unwrap();
-    let state = AppState {
-        db,
-        is_dirty: Arc::clone(&is_dirty),
-    };
 
-    tokio::spawn(async move {
-        let db = store
-            .bucket::<kv::Integer, kv::Json<Song>>(Some("songs"))
-            .unwrap();
-
-        loop {
-            let mut flush = false;
-            {
-                let mut dirty = is_dirty.lock().await;
-                if *dirty {
-                    flush = true;
-                    *dirty = false;
-                }
-            }
-
-            if flush {
-                db.flush_async().await.unwrap();
-            }
+    if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
+        match Sqlite::create_database(DB_URL).await {
+            Ok(_) => {}
+            Err(error) => panic!("error: {}", error),
         }
-    });
+    }
+
+    let db = SqlitePool::connect(DB_URL)
+        .await
+        .expect("Failed to connect to database");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS songs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title VARCHAR(250) NOT NULL,
+        artist VARCHAR(250) NOT NULL,
+        genre VARCHAR(250) NOT NULL,
+        play_count INTEGER DEFAULT 0);",
+    )
+    .execute(&db)
+    .await
+    .expect("Failed to create table");
+
+    let state = AppState { db };
 
     let app = Router::new()
         .route(
@@ -88,110 +83,96 @@ async fn main() {
         .route("/songs/play/:id", get(play_song))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+        .await
+        .expect("Unable to bind to port 8080");
     println!("The server is currently listening on localhost:8080.");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .expect("Infallible server error");
 }
 
-async fn add_song(State(state): State<AppState<'_>>, Json(payload): Json<Song>) -> Json<Song> {
-    let db = &state.db;
+#[axum::debug_handler]
+async fn add_song(State(state): State<AppState>, Json(payload): Json<Song>) -> Json<Song> {
+    let result = sqlx::query("INSERT INTO songs (title, artist, genre) VALUES (?, ?, ?)")
+        .bind(&payload.title)
+        .bind(&payload.artist)
+        .bind(&payload.genre)
+        .execute(&state.db)
+        .await
+        .expect("Failed to insert song");
 
-    let id = db.len() + 1;
-    let song = kv::Json(Song { id, ..payload });
-
-    db.set(&kv::Integer::from(id), &song).unwrap();
-
-    let mut dirty = state.is_dirty.lock().await;
-    *dirty = true;
-
-    Json(song.into_inner())
+    Json(Song {
+        id: result.last_insert_rowid(),
+        ..payload
+    })
 }
 
 async fn search_song(
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<Vec<Song>> {
-    let db = &state.db;
+    let mut query_builder = vec![String::from("SELECT * FROM songs ")];
 
-    let songs = db
-        .iter()
-        .filter_map(|item| {
-            let song = match item {
-                Ok(item) => match item.value::<kv::Json<Song>>() {
-                    Ok(song) => song.into_inner(),
-                    Err(_) => return None,
-                },
-                Err(_) => return None,
-            };
+    for (key, value) in params {
+        if key != "title" && key != "artist" && key != "genre" {
+            continue;
+        }
 
-            for (key, value) in &params {
-                match key.as_str() {
-                    "title" => {
-                        if !song
-                            .title
-                            .to_lowercase()
-                            .contains(value.to_lowercase().as_str())
-                        {
-                            return None;
-                        }
-                    }
-                    "artist" => {
-                        if !song
-                            .artist
-                            .to_lowercase()
-                            .contains(value.to_lowercase().as_str())
-                        {
-                            return None;
-                        }
-                    }
-                    "genre" => {
-                        if !song
-                            .genre
-                            .to_lowercase()
-                            .contains(value.to_lowercase().as_str())
-                        {
-                            return None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        if query_builder.len() == 1 {
+            query_builder.push(String::from("WHERE "));
+        } else {
+            query_builder.push(String::from("AND "));
+        }
 
-            Some(song)
-        })
-        .collect::<Vec<Song>>();
+        query_builder.push(format!("{} LIKE '%{}%' ", key, value));
+    }
 
-    Json(songs)
+    let query = query_builder.join("");
+
+    let song_results = sqlx::query_as::<_, Song>(&query)
+        .fetch_all(&state.db)
+        .await
+        .expect("Failed to fetch songs");
+
+    Json(song_results)
 }
 
 async fn play_song(
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
 ) -> impl IntoResponse {
     const ERROR_JSON: Json<SongNotFound> = Json(SongNotFound {
         error: "Song not found",
     });
 
-    let db = &state.db;
+    let song_id = match params.get("id") {
+        Some(id) => match id.parse::<i64>() {
+            Ok(id) => id,
+            Err(_) => return (StatusCode::BAD_REQUEST, ERROR_JSON.into_response()),
+        },
+        None => return (StatusCode::BAD_REQUEST, ERROR_JSON.into_response()),
+    };
 
-    let id = match params.get("id") {
-        Some(id) => id.parse::<usize>().unwrap(),
+    let song = sqlx::query_as::<_, Song>("SELECT * FROM songs WHERE id = ?")
+        .bind(song_id)
+        .fetch_one(&state.db)
+        .await
+        .ok();
+
+    let mut song = match song {
+        Some(song) => song,
         None => return (StatusCode::NOT_FOUND, ERROR_JSON.into_response()),
     };
 
-    let mut song = match db.get(&kv::Integer::from(id)) {
-        Ok(item) => match item {
-            Some(song) => song,
-            None => return (StatusCode::NOT_FOUND, ERROR_JSON.into_response()),
-        },
-        Err(_) => return (StatusCode::NOT_FOUND, ERROR_JSON.into_response()),
-    };
+    song.play_count += 1;
 
-    song.0.play_count += 1;
+    sqlx::query("UPDATE songs SET play_count = ? WHERE id = ?")
+        .bind(song.play_count)
+        .bind(song_id)
+        .execute(&state.db)
+        .await
+        .expect("Failed to update play count");
 
-    db.set(&kv::Integer::from(id), &song).unwrap();
-    let mut is_dirty = state.is_dirty.lock().await;
-    *is_dirty = true;
-
-    (StatusCode::OK, Json(song.into_inner()).into_response())
+    (StatusCode::OK, Json(song).into_response())
 }

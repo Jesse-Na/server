@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sqlx = { version = "0.8.2", features = ["sqlite", "runtime-tokio"] }
+serde_json = "1.0.133"
 axum = { version = "0.7.9", features = ["macros"] }
 tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread"] }
-kv = { version = "0.24.0", features = ["json-value"] }
-serde_json = "1.0.133"
 serde = { version = "1.0.215", features = ["derive"] }

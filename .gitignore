@@ -1,3 +1,5 @@
 /target
-/song_db
+songs.db
+songs.db-shm
+songs.db-wal
 /test
